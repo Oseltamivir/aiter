@@ -753,6 +753,15 @@ def gemm_a8w8_blockscale_bpreshuffle(
     k = XQ.shape[1]
     Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
 
+    # DSv4-Pro shared expert w2 under TP8:
+    #   [M, 384] x [7168, 384] -> [M, 7168]
+    #
+    # High-concurrency identical-row diagnostics showed row-dependent drift at
+    # L0.ffn.shared.w2.local_no_reduce for this shape, while replaying a small
+    # row sample stayed clean. Route it through the DSv4-safe CK dispatcher.
+    if dtype == dtypes.bf16 and n == 7168 and k == 384:
+        return gemm_a8w8_blockscale_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Y)
+
     # DSv4-Pro TP8 FP8 blockscale projection family:
     #   wkv:            [M, 7168] x [512, 7168]
     #   shared gate_up: [M, 7168] x [768, 7168]

@@ -61,6 +61,20 @@ BlockwiseKernel blockscale_bpreshuffle_dispatch(int M, int N, int K)
             EDataType>;
     }
 
+    // DSv4-Pro shared expert w2 under TP8:
+    //   [M, 384] x [7168, 384] -> [M, 7168]
+    //
+    // This shape is not in the tuned table. Without an explicit override it
+    // falls through to the generic heuristic, which corrupts identical rows at
+    // high concurrency. Keep this before exact/padded lookup so future table
+    // changes cannot bypass the safe path.
+    if(N == 7168 && K == 384)
+    {
+        return a8w8_blockscale_bpreshuffle_1x128x128_256x64x128x256_16x16_16x16_16x16x1_16x16x1_1x32x1x8_8_2x1_intrawave_v1<
+            DDataType,
+            EDataType>;
+    }
+
     // DSv4-Pro wo_b under TP8 has local GEMM shape [M, 2048] x [7168, 2048].
     // Keep this before lookup as well so direct/padded table hits cannot
     // bypass the DSv4-safe path.
