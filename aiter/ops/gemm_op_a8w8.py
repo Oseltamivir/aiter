@@ -753,6 +753,17 @@ def gemm_a8w8_blockscale_bpreshuffle(
     k = XQ.shape[1]
     Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
 
+    # DSv4-Pro TP8 FP8 blockscale projection family:
+    #   wkv:            [M, 7168] x [512, 7168]
+    #   shared gate_up: [M, 7168] x [768, 7168]
+    #   wq_a:           [M, 7168] x [1536, 7168]
+    #
+    # Identical-row prefill diagnostics showed row-dependent drift for these
+    # shapes under tuned/ASM BPRESHUFFLE dispatch. CK plus the DSv4-specific
+    # C++ dispatcher below preserves identical-row invariance.
+    if dtype == dtypes.bf16 and k == 7168 and n in (512, 768, 1536):
+        return gemm_a8w8_blockscale_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Y)
+
     # DSv4-Pro wo_b under TP8 uses local shape [M, 2048] x [7168, 2048].
     # The tuned table only has the full M=20480 row. Batched eval/prefill emits
     # partial-M fragments (for example M=5544) that route through padded tuned

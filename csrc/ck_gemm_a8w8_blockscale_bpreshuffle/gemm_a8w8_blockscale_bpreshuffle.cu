@@ -47,6 +47,30 @@ BlockwiseKernel blockscale_bpreshuffle_dispatch(int M, int N, int K)
     const int cu_num         = get_device_cu_num();
     const std::string& gfx   = get_device_gfx();
 
+    // DSv4-Pro TP8 FP8 blockscale projection family:
+    //   wkv:            [M, 7168] x [512, 7168]
+    //   shared gate_up: [M, 7168] x [768, 7168]
+    //   wq_a:           [M, 7168] x [1536, 7168]
+    //
+    // Check this before exact/padded lookup. Some table hits are not
+    // correctness-safe for identical rows in DSv4 batched prefill.
+    if(K == 7168 && (N == 512 || N == 768 || N == 1536))
+    {
+        return a8w8_blockscale_bpreshuffle_1x128x128_256x64x256x128_16x16_16x16_8x32x1_8x32x1_1x32x1x8_8_2x1_intrawave_v1<
+            DDataType,
+            EDataType>;
+    }
+
+    // DSv4-Pro wo_b under TP8 has local GEMM shape [M, 2048] x [7168, 2048].
+    // Keep this before lookup as well so direct/padded table hits cannot
+    // bypass the DSv4-safe path.
+    if(N == 7168 && K == 2048)
+    {
+        return a8w8_blockscale_bpreshuffle_1x128x128_256x64x256x128_16x16_16x16_8x32x1_8x32x1_1x32x1x8_8_2x1_intrawave_v1<
+            DDataType,
+            EDataType>;
+    }
+
     // First check if this shape(M,N,K) is available in the direct lookup.
     auto it = lookup.find({gfx, cu_num, M, N, K});
     // If we found an optimal kernel, use it.
@@ -74,28 +98,6 @@ BlockwiseKernel blockscale_bpreshuffle_dispatch(int M, int N, int K)
     if(it != lookup.end())
     {
         return it->second;
-    }
-
-    // DSv4-Pro wkv under TP8 has local GEMM shape [M, 7168] x [512, 7168].
-    // For partial-M batched prefill fragments, Python routes padded ASM hits
-    // here for stricter actual-M masking. Do not fall through to the generic
-    // heuristic: use the tuned full-shape CK kernel for this DSv4 shape family.
-    if(N == 512 && K == 7168)
-    {
-        return a8w8_blockscale_bpreshuffle_1x128x128_256x64x256x128_16x16_16x16_8x32x1_8x32x1_1x32x1x8_8_2x1_intrawave_v1<
-            DDataType,
-            EDataType>;
-    }
-
-    // DSv4-Pro wo_b under TP8 has local GEMM shape [M, 2048] x [7168, 2048].
-    // The Python dispatch routes partial-M fragments through generic CK for stricter
-    // actual-M masking. If callers reach this direct CK entrypoint anyway, use
-    // the tuned full-shape kernel instead of the smaller generic heuristic.
-    if(N == 7168 && K == 2048)
-    {
-        return a8w8_blockscale_bpreshuffle_1x128x128_256x64x256x128_16x16_16x16_8x32x1_8x32x1_1x32x1x8_8_2x1_intrawave_v1<
-            DDataType,
-            EDataType>;
     }
 
     // Otherwise, use heuristics.
