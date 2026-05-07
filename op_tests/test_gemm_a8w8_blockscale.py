@@ -190,6 +190,8 @@ def test_blockscale_bpreshuffle_repeated_rows_invariant():
         (176, 1536, 7168),
         (352, 512, 7168),
         (352, 1536, 7168),
+        (1600, 512, 7168),
+        (5544, 512, 7168),
         (5544, 7168, 2048),
     ]
     for m, n, k in shapes:

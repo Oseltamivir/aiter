@@ -76,6 +76,17 @@ BlockwiseKernel blockscale_bpreshuffle_dispatch(int M, int N, int K)
         return it->second;
     }
 
+    // DSv4-Pro wkv under TP8 has local GEMM shape [M, 7168] x [512, 7168].
+    // For partial-M batched prefill fragments, Python routes padded ASM hits
+    // here for stricter actual-M masking. Do not fall through to the generic
+    // heuristic: use the tuned full-shape CK kernel for this DSv4 shape family.
+    if(N == 512 && K == 7168)
+    {
+        return a8w8_blockscale_bpreshuffle_1x128x128_256x64x256x128_16x16_16x16_8x32x1_8x32x1_1x32x1x8_8_2x1_intrawave_v1<
+            DDataType,
+            EDataType>;
+    }
+
     // DSv4-Pro wo_b under TP8 has local GEMM shape [M, 2048] x [7168, 2048].
     // The Python dispatch routes partial-M fragments through generic CK for stricter
     // actual-M masking. If callers reach this direct CK entrypoint anyway, use

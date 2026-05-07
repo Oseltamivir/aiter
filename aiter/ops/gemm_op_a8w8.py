@@ -768,14 +768,13 @@ def gemm_a8w8_blockscale_bpreshuffle(
 
     if config is not None:
         libtype = config["libtype"]
-        # The ASM blockscale kernels are tuned for exact or padded M buckets.
-        # For small DSv4 partial-M projections (for example M=176/352 mapping
-        # to the 256/512 buckets), the padded ASM path can produce
-        # row-dependent BF16 ULP drift for identical rows. CK handles MNK
-        # padding internally and preserves row equivalence, so use it for
-        # these small partial-M cases.
+        # ASM blockscale kernels are only correctness-safe for exact-M table
+        # hits. A padded-M table hit selects a kernel specialization for a
+        # different M bucket and has produced row-dependent BF16 drift for
+        # identical rows in DSv4 partial prefill projections. CK handles the
+        # actual M tail, so use CK for all partial-M ASM hits.
         matched_m = int(config.get("_matched_m", m))
-        if libtype == "asm" and matched_m != m and matched_m <= 512:
+        if libtype == "asm" and matched_m != m:
             return gemm_a8w8_blockscale_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Y)
         if libtype == "cktile":
             return gemm_a8w8_blockscale_bpreshuffle_cktile(XQ, WQ, x_scale, w_scale, Y)
