@@ -344,7 +344,6 @@ namespace aiter {
         __shared__ float s_hc_mult3[num_rows * hc_mult3];
         __shared__ DTYPE_I s_res[2 * num_rows * hc_mult * residual_block];
 
-        using fp32x4_t = opus::vector_t<float, 4>;
         using floatx8_t = opus::vector_t<float, 8>;
         using halfx8_t = opus::vector_t<DTYPE_I, 8>;
         const int m_idx = num_rows * blockIdx.x;
@@ -353,13 +352,6 @@ namespace aiter {
         const int m_oob = m < m_idx + num_rows ? (m - m_idx) : num_rows;
         auto sigmoid = [](float x) { return 1.0f / (1.0f + __expf(-x)); };
         static_assert(block_size >= num_rows * hc_mult3, "block_size must be >= num_rows * hc_mult3");
-        if (threadIdx.x < num_rows * hc_mult3) {
-            s_hc_mult3[threadIdx.x] = 0.0f;
-        }
-        // s_hc_mult3 is the split-K accumulation buffer for mixes. Ensure the
-        // zero-fill is globally visible before any thread can atomicAdd into it.
-        __syncthreads();
-        
         // _pre_norm_fn_fwd_norm
         float rms[num_rows] = {0.0f};
         static_assert((num_rows & (num_rows - 1)) == 0 && num_rows > 0, "num_rows must be a power of 2");
@@ -380,30 +372,27 @@ namespace aiter {
             rms[i] = rsqrtf(rms[i] / (hidden_size * hc_mult) + rms_eps);
         }
 
-        // load gemm_out_mul and accumulate to s_hc_mult3
+        // Load gemm_out_mul and accumulate to s_hc_mult3. Use one thread per
+        // row/coefficient and sum split-K in a fixed order. The previous
+        // shared-memory atomicAdd path was race-free after the zero-fill
+        // barrier, but the atomic accumulation order could still vary by row
+        // and produce tiny FP32 drift. DSv4 mHC amplifies that drift through
+        // BF16 residual updates, so keep this reduction deterministic.
         float* gemm_out_mul_ptr = gemm_out_mul + m_idx * gemm_out_mul_stride;
         auto buffer_gemm_out_mul = opus::make_gmem<float>(gemm_out_mul_ptr, (n_splits * m - m_idx) * gemm_out_mul_stride * sizeof(float));
-        const int out_loop = (n_splits * num_rows * hc_mult3 + 4 * block_size - 1) / (4 * block_size);
-        const int total_mix = n_splits * num_rows * hc_mult3;
-        for(int i =0; i < out_loop; i++) {
-            int idx = i * 4 * block_size + threadIdx.x * 4;
-            int split_idx = idx / (num_rows * hc_mult3);
-            int row_idx = (idx / hc_mult3) % num_rows;
-            int row_offset = idx % hc_mult3;
-            int offset = row_idx * gemm_out_mul_stride + split_idx * m * gemm_out_mul_stride;
-
-            fp32x4_t v_gemm_out_mul;
-            opus::clear(v_gemm_out_mul);
-            if (idx < total_mix) {
-                v_gemm_out_mul = buffer_gemm_out_mul.template load<4>(offset + row_offset);
+        if (threadIdx.x < num_rows * hc_mult3) {
+            int row_idx = threadIdx.x / hc_mult3;
+            int row_offset = threadIdx.x % hc_mult3;
+            float acc = 0.0f;
+            if (row_idx < m_oob) {
                 float my_rms = rms[row_idx];
-                for(int j = 0; j < 4; j++) {
-                    if (idx + j < total_mix) {
-                        v_gemm_out_mul[j] *= my_rms;
-                        atomicAdd(&s_hc_mult3[row_idx * hc_mult3 + row_offset + j], v_gemm_out_mul[j]);
-                    }
+                for (int split_idx = 0; split_idx < n_splits; split_idx++) {
+                    int offset = row_idx * gemm_out_mul_stride + split_idx * m * gemm_out_mul_stride + row_offset;
+                    opus::vector<float, 1>::type v_gemm_out_mul = buffer_gemm_out_mul.template load<1>(offset);
+                    acc += v_gemm_out_mul[0] * my_rms;
                 }
             }
+            s_hc_mult3[threadIdx.x] = acc;
         }
         __syncthreads();
 

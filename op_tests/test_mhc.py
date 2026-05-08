@@ -569,6 +569,7 @@ def test_mhc_pre_repeated_rows_invariant_high_conc():
             layer_input_ref, layer_input_hip, msg=f"batch={batch} layer_input"
         )
 
+        invariant_tol = 1e-5
         for name, tensor in (
             ("post_mix", post_mix_hip),
             ("comb_mix", comb_mix_hip),
@@ -577,8 +578,10 @@ def test_mhc_pre_repeated_rows_invariant_high_conc():
             view = tensor.view(batch, seqlen, *tensor.shape[1:]).float()
             diff = (view - view[:1]).abs()
             max_abs = diff.max().item()
-            if max_abs > 1e-3:
-                bad = (diff.reshape(batch, seqlen, -1).amax(-1) > 1e-3).nonzero()
+            if max_abs > invariant_tol:
+                bad = (
+                    diff.reshape(batch, seqlen, -1).amax(-1) > invariant_tol
+                ).nonzero()
                 raise AssertionError(
                     f"batch={batch} {name} repeated-row invariant failed: "
                     f"{max_abs=}, first_bad={bad[:4].detach().cpu().tolist()}"
