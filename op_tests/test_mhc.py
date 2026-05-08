@@ -528,6 +528,63 @@ def test_mhc_pre_repeated_rows_invariant():
             )
 
 
+def test_mhc_pre_repeated_rows_invariant_high_conc():
+    """DSv4 conc=64 regression: fused mhc_pre post/comb must preserve identical rows."""
+    seqlen = 88
+    hidden_size = 7168
+    hc_mult = 4
+    hc_mult2 = hc_mult * hc_mult
+    hc_mult3 = hc_mult * 2 + hc_mult2
+    hc_hidden_size = hc_mult * hidden_size
+    extra_args = {
+        "rms_eps": 1e-6,
+        "hc_pre_eps": 1e-6,
+        "hc_sinkhorn_eps": 1e-6,
+        "hc_post_mult_value": 2.0,
+        "sinkhorn_repeat": 20,
+    }
+
+    for batch in (62, 63, 64):
+        torch.manual_seed(1234 + batch)
+        pattern = torch.randn(seqlen, hc_mult, hidden_size, dtype=dtypes.bf16)
+        residual = pattern.repeat(batch, 1, 1).contiguous()
+        fn = torch.randn(hc_mult3, hc_hidden_size, dtype=dtypes.fp32)
+        hc_scale = torch.randn((3,), dtype=dtypes.fp32) * 0.1
+        hc_base = torch.randn((hc_mult3,), dtype=dtypes.fp32) * 0.1
+
+        post_mix_ref, comb_mix_ref, layer_input_ref = mhc_pre_ref(
+            residual, fn, hc_scale, hc_base, **extra_args
+        )
+        post_mix_hip, comb_mix_hip, layer_input_hip = mhc_pre_hip(
+            residual,
+            fn,
+            hc_scale,
+            hc_base,
+            **extra_args,
+        )
+
+        checkAllclose(post_mix_ref, post_mix_hip, msg=f"batch={batch} post_mix")
+        checkAllclose(comb_mix_ref, comb_mix_hip, msg=f"batch={batch} comb_mix")
+        checkAllclose(
+            layer_input_ref, layer_input_hip, msg=f"batch={batch} layer_input"
+        )
+
+        for name, tensor in (
+            ("post_mix", post_mix_hip),
+            ("comb_mix", comb_mix_hip),
+            ("layer_input", layer_input_hip),
+        ):
+            view = tensor.view(batch, seqlen, *tensor.shape[1:]).float()
+            diff = (view - view[:1]).abs()
+            max_abs = diff.max().item()
+            if max_abs > 1e-3:
+                bad = (diff.reshape(batch, seqlen, -1).amax(-1) > 1e-3).nonzero()
+                raise AssertionError(
+                    f"batch={batch} {name} repeated-row invariant failed: "
+                    f"{max_abs=}, first_bad={bad[:4].detach().cpu().tolist()}"
+                )
+
+
 # copy from tilelang/examples/deepseek_mhc/example_mhc_post.py
 def mhc_post_tilelang(
     x: torch.Tensor,
@@ -728,6 +785,7 @@ df = pd.DataFrame(df)
 df_md = df.to_markdown(index=False)
 aiter.logger.info("mhc_pre summary (markdown):\n%s", df_md)
 test_mhc_pre_repeated_rows_invariant()
+test_mhc_pre_repeated_rows_invariant_high_conc()
 
 if not args.hc_head:
     df = []

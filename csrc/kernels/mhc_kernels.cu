@@ -356,6 +356,9 @@ namespace aiter {
         if (threadIdx.x < num_rows * hc_mult3) {
             s_hc_mult3[threadIdx.x] = 0.0f;
         }
+        // s_hc_mult3 is the split-K accumulation buffer for mixes. Ensure the
+        // zero-fill is globally visible before any thread can atomicAdd into it.
+        __syncthreads();
         
         // _pre_norm_fn_fwd_norm
         float rms[num_rows] = {0.0f};
@@ -381,19 +384,24 @@ namespace aiter {
         float* gemm_out_mul_ptr = gemm_out_mul + m_idx * gemm_out_mul_stride;
         auto buffer_gemm_out_mul = opus::make_gmem<float>(gemm_out_mul_ptr, (n_splits * m - m_idx) * gemm_out_mul_stride * sizeof(float));
         const int out_loop = (n_splits * num_rows * hc_mult3 + 4 * block_size - 1) / (4 * block_size);
+        const int total_mix = n_splits * num_rows * hc_mult3;
         for(int i =0; i < out_loop; i++) {
             int idx = i * 4 * block_size + threadIdx.x * 4;
             int split_idx = idx / (num_rows * hc_mult3);
             int row_idx = (idx / hc_mult3) % num_rows;
             int row_offset = idx % hc_mult3;
             int offset = row_idx * gemm_out_mul_stride + split_idx * m * gemm_out_mul_stride;
-            fp32x4_t v_gemm_out_mul = buffer_gemm_out_mul.template load<4>(offset + row_offset);
 
-            if (idx < n_splits * num_rows * hc_mult3) {
+            fp32x4_t v_gemm_out_mul;
+            opus::clear(v_gemm_out_mul);
+            if (idx < total_mix) {
+                v_gemm_out_mul = buffer_gemm_out_mul.template load<4>(offset + row_offset);
                 float my_rms = rms[row_idx];
                 for(int j = 0; j < 4; j++) {
-                    v_gemm_out_mul[j] *= my_rms;
-                    atomicAdd(&s_hc_mult3[row_idx * hc_mult3 + row_offset + j], v_gemm_out_mul[j]);
+                    if (idx + j < total_mix) {
+                        v_gemm_out_mul[j] *= my_rms;
+                        atomicAdd(&s_hc_mult3[row_idx * hc_mult3 + row_offset + j], v_gemm_out_mul[j]);
+                    }
                 }
             }
         }
