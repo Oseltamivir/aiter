@@ -24,6 +24,8 @@ BLOCK_SIZE_M = 32
 # Default to Opus unless CK sorting is explicitly requested.
 _USE_CK_MOE_SORTING = os.environ.get("AITER_USE_CK_MOE_SORTING", "0") == "1"
 _MOE_DEBUG_BLOCKS_PRINTED = False
+_MOE_DEBUG_REPEATED_INPUT_PRINTED = False
+_MOE_DEBUG_REPEATED_STAGES_PRINTED = set()
 
 
 def _moe_sorting_impl(
@@ -40,16 +42,16 @@ def _moe_sorting_impl(
 ):
     device = topk_ids.device
     M, topk = topk_ids.shape
-    num_assignments = int(topk_ids.numel())
     max_num_tokens_padded = int(topk_ids.numel() + num_experts * block_size - topk)
 
     max_num_m_blocks = int((max_num_tokens_padded + block_size - 1) // block_size)
+    invalid_sorted_id = (topk << 24) | M
     # MoE stage kernels consume block-padded sorted metadata. Padding entries
     # must be deterministic even if the sorting kernel only writes valid
     # assignments.
     sorted_ids = torch.full(
         (max_num_tokens_padded,),
-        num_assignments,
+        invalid_sorted_id,
         dtype=dtypes.i32,
         device=device,
     )
@@ -147,36 +149,70 @@ def moe_sorting(
         raise e
 
 
-def _compact_fp4_asm_sorted_expert_ids(
+def _moe_debug_enabled():
+    return os.environ.get("AITER_DSV4_MOE_DEBUG_BLOCKS", "0") == "1"
+
+
+def _callable_name(func):
+    if isinstance(func, functools.partial):
+        name = _callable_name(func.func)
+        kernel_name = func.keywords.get("kernelName") if func.keywords else None
+        if kernel_name:
+            return f"{name}[{kernel_name}]"
+        return name
+    return getattr(func, "__name__", func.__class__.__name__)
+
+
+def _is_fp4_sorted_metadata_path(quant_type, q_dtype_w, block_size_M):
+    return (
+        quant_type == QuantType.per_1x32
+        and q_dtype_w == dtypes.fp4x2
+        and block_size_M is not None
+    )
+
+
+def _compact_fp4_sorted_metadata(
     sorted_ids,
+    sorted_weights,
     sorted_expert_ids,
     num_valid_ids,
     M,
     topk,
     global_E,
     block_size_M,
+    metadata,
 ):
-    # ASM fmoe_g1u1 uses sorted_expert_ids.size(0) for both kernel selection
-    # and grid size. The sorting buffer is allocated at max padded capacity,
-    # so pass only the blocks reported valid by the sorting kernel.
+    # Some FP4 MoE launchers size work from the allocated sorted metadata
+    # tensors rather than the valid post-sort block count. Keep the tensors
+    # compact so both 1-stage and 2-stage paths launch only real expert blocks.
     block_size_M = int(block_size_M)
     valid_tokens_post_pad = int(num_valid_ids[0].item())
     valid_blocks_by_num_valid = (
         valid_tokens_post_pad + block_size_M - 1
     ) // block_size_M
 
-    debug_blocks = os.environ.get("AITER_DSV4_MOE_DEBUG_BLOCKS", "0") == "1"
-    valid_blocks_by_sentinel = None
-    if debug_blocks or valid_blocks_by_num_valid <= 0:
-        valid_blocks_by_sentinel = int((sorted_expert_ids >= 0).sum().item())
-
-    valid_blocks = valid_blocks_by_num_valid
-    if valid_blocks <= 0 and valid_blocks_by_sentinel is not None:
+    valid_blocks_by_sentinel = int((sorted_expert_ids >= 0).sum().item())
+    if 0 < valid_blocks_by_sentinel < sorted_expert_ids.shape[0]:
+        valid_blocks = max(valid_blocks_by_sentinel, valid_blocks_by_num_valid)
+    else:
+        valid_blocks = valid_blocks_by_num_valid
+    if valid_blocks <= 0:
         valid_blocks = valid_blocks_by_sentinel
     if valid_blocks <= 0:
-        return sorted_expert_ids
+        return sorted_ids, sorted_weights, sorted_expert_ids
 
     valid_blocks = min(valid_blocks, sorted_expert_ids.shape[0])
+    valid_token_capacity = min(valid_blocks * block_size_M, sorted_ids.shape[0])
+    compact_sorted_ids = (
+        sorted_ids
+        if valid_token_capacity == sorted_ids.shape[0]
+        else sorted_ids[:valid_token_capacity].contiguous()
+    )
+    compact_sorted_weights = (
+        sorted_weights
+        if valid_token_capacity == sorted_weights.shape[0]
+        else sorted_weights[:valid_token_capacity].contiguous()
+    )
     compact_sorted_expert_ids = (
         sorted_expert_ids
         if valid_blocks == sorted_expert_ids.shape[0]
@@ -184,13 +220,15 @@ def _compact_fp4_asm_sorted_expert_ids(
     )
 
     global _MOE_DEBUG_BLOCKS_PRINTED
-    if debug_blocks and not _MOE_DEBUG_BLOCKS_PRINTED:
-        if valid_blocks_by_sentinel is None:
-            valid_blocks_by_sentinel = int((sorted_expert_ids >= 0).sum().item())
+    if _moe_debug_enabled() and not _MOE_DEBUG_BLOCKS_PRINTED:
         print(
             "[AITER MoE debug] "
             f"M={M} topk={topk} E={global_E} block_m={block_size_M} "
+            f"run_1stage={metadata.run_1stage} "
+            f"stage1={_callable_name(metadata.stage1)} "
+            f"stage2={_callable_name(metadata.stage2)} "
             f"sorted_ids={tuple(sorted_ids.shape)} "
+            f"compacted_sorted_ids={tuple(compact_sorted_ids.shape)} "
             f"sorted_expert_ids={tuple(sorted_expert_ids.shape)} "
             f"compacted_sorted_expert_ids={tuple(compact_sorted_expert_ids.shape)} "
             f"num_valid_ids={num_valid_ids.detach().cpu().tolist()} "
@@ -200,7 +238,80 @@ def _compact_fp4_asm_sorted_expert_ids(
         )
         _MOE_DEBUG_BLOCKS_PRINTED = True
 
-    return compact_sorted_expert_ids
+    return compact_sorted_ids, compact_sorted_weights, compact_sorted_expert_ids
+
+
+def _debug_row0_repeated_input(hidden_states, topk_ids, topk_weight):
+    if not _moe_debug_enabled():
+        return False
+    M = hidden_states.shape[0]
+    max_m = int(os.environ.get("AITER_DSV4_MOE_DEBUG_MAX_M", "64"))
+    if M < 2 or M > max_m:
+        return False
+    try:
+        hidden_diff = (
+            hidden_states.detach().float() - hidden_states[:1].detach().float()
+        ).abs()
+        hidden_max_abs = float(hidden_diff.max().item())
+        ids_same = bool((topk_ids == topk_ids[:1]).all().item())
+        weight_diff = (
+            topk_weight.detach().float() - topk_weight[:1].detach().float()
+        ).abs()
+        weight_max_abs = float(weight_diff.max().item())
+    except Exception as exc:
+        print(
+            f"[AITER MoE debug] row0_repeated_input_check_failed={exc}",
+            flush=True,
+        )
+        return False
+
+    is_repeated = hidden_max_abs == 0.0 and ids_same and weight_max_abs == 0.0
+    global _MOE_DEBUG_REPEATED_INPUT_PRINTED
+    if is_repeated and not _MOE_DEBUG_REPEATED_INPUT_PRINTED:
+        print(
+            "[AITER MoE debug] "
+            f"row0_repeated_input M={M} topk={topk_ids.shape[1]} "
+            f"hidden_max_abs={hidden_max_abs} "
+            f"topk_ids_same={ids_same} "
+            f"topk_weight_max_abs={weight_max_abs}",
+            flush=True,
+        )
+        _MOE_DEBUG_REPEATED_INPUT_PRINTED = True
+    return is_repeated
+
+
+def _debug_row0_repeated_tensor(name, tensor, enabled):
+    if not enabled or not _moe_debug_enabled() or tensor is None:
+        return
+    if name in _MOE_DEBUG_REPEATED_STAGES_PRINTED:
+        return
+    M = tensor.shape[0]
+    max_m = int(os.environ.get("AITER_DSV4_MOE_DEBUG_MAX_M", "64"))
+    if M < 2 or M > max_m:
+        return
+    try:
+        flat = tensor.detach().float().reshape(M, -1)
+        diff = (flat - flat[:1]).abs()
+        row_max = diff.amax(dim=1)
+        tol = float(os.environ.get("AITER_DSV4_MOE_DEBUG_TOL", "0"))
+        bad_rows = int((row_max > tol).sum().item())
+        max_abs = float(row_max.max().item())
+        mean_abs = float(diff.mean().item())
+    except Exception as exc:
+        print(
+            f"[AITER MoE debug] {name}.row0_repeated_check_failed={exc}",
+            flush=True,
+        )
+        return
+
+    print(
+        "[AITER MoE debug] "
+        f"{name}.row0_repeated shape={tuple(tensor.shape)} "
+        f"max_abs={max_abs:.8g} mean_abs={mean_abs:.8g} "
+        f"bad_rows={bad_rows}/{M}",
+        flush=True,
+    )
+    _MOE_DEBUG_REPEATED_STAGES_PRINTED.add(name)
 
 
 # Lru cache will using hash to create key, which makes error when w1,w2 shape is symint.
@@ -409,23 +520,25 @@ def fused_moe_(
         num_local_tokens,
         moe_sorting_dispatch_policy,
     )
+    debug_row0_repeated = _debug_row0_repeated_input(
+        hidden_states, topk_ids, topk_weight
+    )
+
+    if _is_fp4_sorted_metadata_path(quant_type, q_dtype_w, block_size_M):
+        sorted_ids, sorted_weights, sorted_expert_ids = _compact_fp4_sorted_metadata(
+            sorted_ids,
+            sorted_weights,
+            sorted_expert_ids,
+            num_valid_ids,
+            M,
+            topk,
+            global_E,
+            block_size_M,
+            metadata,
+        )
 
     if metadata.run_1stage:
-        if (
-            quant_type == QuantType.per_1x32
-            and q_dtype_w == dtypes.fp4x2
-            and block_size_M is not None
-        ):
-            sorted_expert_ids = _compact_fp4_asm_sorted_expert_ids(
-                sorted_ids,
-                sorted_expert_ids,
-                num_valid_ids,
-                M,
-                topk,
-                global_E,
-                block_size_M,
-            )
-        return metadata.stage1(
+        moe_out = metadata.stage1(
             hidden_states,
             w1,
             w2,
@@ -450,6 +563,8 @@ def fused_moe_(
             device=topk_ids.device,
             doweight_stage1=doweight_stage1,
         )
+        _debug_row0_repeated_tensor("moe_1stage_out", moe_out, debug_row0_repeated)
+        return moe_out
     else:
         return fused_moe_2stages(
             hidden_states,
@@ -478,6 +593,7 @@ def fused_moe_(
             intermediate_pad=intermediate_pad,
             bias1=bias1,
             bias2=bias2,
+            debug_row0_repeated=debug_row0_repeated,
         )
 
 
@@ -1322,6 +1438,7 @@ def fused_moe_2stages(
     intermediate_pad=0,
     bias1=None,
     bias2=None,
+    debug_row0_repeated=False,
 ):
     quant_func = get_quant(quant_type)
     token_num, _ = hidden_states.shape
@@ -1521,6 +1638,8 @@ def fused_moe_2stages(
         )
         a2 = a2.view(token_num, topk, inter_dim)
 
+    _debug_row0_repeated_tensor("moe_stage1_out", a2, debug_row0_repeated)
+
     metadata.stage2(
         a2,
         w1,
@@ -1538,6 +1657,8 @@ def fused_moe_2stages(
         sorted_weights=sorted_weights if not doweight_stage1 else None,
         **extra_stage2_args,
     )
+
+    _debug_row0_repeated_tensor("moe_stage2_out", moe_out, debug_row0_repeated)
 
     return moe_out
 
