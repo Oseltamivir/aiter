@@ -23,9 +23,14 @@ BLOCK_SIZE_M = 32
 
 # Default to Opus unless CK sorting is explicitly requested.
 _USE_CK_MOE_SORTING = os.environ.get("AITER_USE_CK_MOE_SORTING", "0") == "1"
+_DSV4_MOE_DETERMINISTIC_TOPK1 = (
+    os.environ.get("AITER_DSV4_MOE_DETERMINISTIC_TOPK1", "0") == "1"
+)
+_DSV4_MOE_DETERMINISTIC_TOPK1_ACTIVE = False
 _MOE_DEBUG_BLOCKS_PRINTED = False
 _MOE_DEBUG_REPEATED_INPUT_PRINTED = False
 _MOE_DEBUG_REPEATED_STAGES_PRINTED = set()
+_MOE_DEBUG_REPEATED_INPUT_PRINTED_KEYS = set()
 
 
 def _moe_sorting_impl(
@@ -301,7 +306,8 @@ def _debug_row0_repeated_input(hidden_states, topk_ids, topk_weight):
 
     is_repeated = hidden_max_abs == 0.0 and ids_same and weight_max_abs == 0.0
     global _MOE_DEBUG_REPEATED_INPUT_PRINTED
-    if is_repeated and not _MOE_DEBUG_REPEATED_INPUT_PRINTED:
+    key = (M, int(topk_ids.shape[1]))
+    if is_repeated and key not in _MOE_DEBUG_REPEATED_INPUT_PRINTED_KEYS:
         print(
             "[AITER MoE debug] "
             f"row0_repeated_input M={M} topk={topk_ids.shape[1]} "
@@ -310,16 +316,18 @@ def _debug_row0_repeated_input(hidden_states, topk_ids, topk_weight):
             f"topk_weight_max_abs={weight_max_abs}",
             flush=True,
         )
+        _MOE_DEBUG_REPEATED_INPUT_PRINTED_KEYS.add(key)
         _MOE_DEBUG_REPEATED_INPUT_PRINTED = True
     return is_repeated
 
 
-def _debug_row0_repeated_tensor(name, tensor, enabled):
+def _debug_row0_repeated_tensor(name, tensor, enabled, topk=None):
     if not enabled or not _moe_debug_enabled() or tensor is None:
         return
-    if name in _MOE_DEBUG_REPEATED_STAGES_PRINTED:
-        return
     M = tensor.shape[0]
+    key = (name, int(M), None if topk is None else int(topk))
+    if key in _MOE_DEBUG_REPEATED_STAGES_PRINTED:
+        return
     max_m = int(os.environ.get("AITER_DSV4_MOE_DEBUG_MAX_M", "64"))
     if M < 2 or M > max_m:
         return
@@ -345,7 +353,7 @@ def _debug_row0_repeated_tensor(name, tensor, enabled):
         f"bad_rows={bad_rows}/{M}",
         flush=True,
     )
-    _MOE_DEBUG_REPEATED_STAGES_PRINTED.add(name)
+    _MOE_DEBUG_REPEATED_STAGES_PRINTED.add(key)
 
 
 # Lru cache will using hash to create key, which makes error when w1,w2 shape is symint.
@@ -521,6 +529,55 @@ def fused_moe_(
         else:
             q_dtype_a = dtypes.fp4x2
 
+    global _DSV4_MOE_DETERMINISTIC_TOPK1_ACTIVE
+    is_dsv4_fp4_routed = (
+        quant_type == QuantType.per_1x32
+        and q_dtype_w == dtypes.fp4x2
+        and activation == ActivationType.Silu
+        and model_dim == 7168
+        and topk > 1
+    )
+    if (
+        _DSV4_MOE_DETERMINISTIC_TOPK1
+        and is_dsv4_fp4_routed
+        and not _DSV4_MOE_DETERMINISTIC_TOPK1_ACTIVE
+    ):
+        _DSV4_MOE_DETERMINISTIC_TOPK1_ACTIVE = True
+        try:
+            acc = torch.zeros(
+                (M, model_dim),
+                dtype=torch.float32,
+                device=hidden_states.device,
+            )
+            for k in range(topk):
+                out_k = fused_moe_(
+                    hidden_states=hidden_states,
+                    w1=w1,
+                    w2=w2,
+                    topk_weight=topk_weight[:, k : k + 1].contiguous(),
+                    topk_ids=topk_ids[:, k : k + 1].contiguous(),
+                    expert_mask=expert_mask,
+                    activation=activation.value,
+                    quant_type=quant_type.value,
+                    doweight_stage1=doweight_stage1,
+                    w1_scale=w1_scale,
+                    w2_scale=w2_scale,
+                    a1_scale=a1_scale,
+                    a2_scale=a2_scale,
+                    block_size_M=-1 if block_size_M is None else int(block_size_M),
+                    num_local_tokens=num_local_tokens,
+                    moe_sorting_dispatch_policy=moe_sorting_dispatch_policy,
+                    dtype=dtype,
+                    hidden_pad=hidden_pad,
+                    intermediate_pad=intermediate_pad,
+                    bias1=bias1,
+                    bias2=bias2,
+                )
+                acc.add_(out_k.float())
+            return acc.to(dtype)
+        finally:
+            _DSV4_MOE_DETERMINISTIC_TOPK1_ACTIVE = False
+
     metadata = get_2stage_cfgs(
         get_padded_M(M),  # consider token_num > 1024 as prefill
         model_dim,
@@ -600,7 +657,9 @@ def fused_moe_(
             device=topk_ids.device,
             doweight_stage1=doweight_stage1,
         )
-        _debug_row0_repeated_tensor("moe_1stage_out", moe_out, debug_row0_repeated)
+        _debug_row0_repeated_tensor(
+            "moe_1stage_out", moe_out, debug_row0_repeated, topk
+        )
         return moe_out
     else:
         return fused_moe_2stages(
@@ -1675,7 +1734,9 @@ def fused_moe_2stages(
         )
         a2 = a2.view(token_num, topk, inter_dim)
 
-    _debug_row0_repeated_tensor("moe_stage1_out", a2, debug_row0_repeated)
+    _debug_row0_repeated_tensor(
+        "moe_stage1_out", a2, debug_row0_repeated, topk
+    )
 
     metadata.stage2(
         a2,
@@ -1695,7 +1756,9 @@ def fused_moe_2stages(
         **extra_stage2_args,
     )
 
-    _debug_row0_repeated_tensor("moe_stage2_out", moe_out, debug_row0_repeated)
+    _debug_row0_repeated_tensor(
+        "moe_stage2_out", moe_out, debug_row0_repeated, topk
+    )
 
     return moe_out
 
