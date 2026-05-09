@@ -39,16 +39,25 @@ def _moe_sorting_impl(
 ):
     device = topk_ids.device
     M, topk = topk_ids.shape
+    num_assignments = int(topk_ids.numel())
     max_num_tokens_padded = int(topk_ids.numel() + num_experts * block_size - topk)
 
     max_num_m_blocks = int((max_num_tokens_padded + block_size - 1) // block_size)
-    sorted_ids = torch.empty(max_num_tokens_padded, dtype=dtypes.i32, device=device)
-    sorted_weights = torch.empty(
+    # MoE stage kernels consume block-padded sorted metadata. Padding entries
+    # must be deterministic even if the sorting kernel only writes valid
+    # assignments.
+    sorted_ids = torch.full(
+        (max_num_tokens_padded,),
+        num_assignments,
+        dtype=dtypes.i32,
+        device=device,
+    )
+    sorted_weights = torch.zeros(
         max_num_tokens_padded, dtype=dtypes.fp32, device=device
     )
-    sorted_expert_ids = torch.empty(max_num_m_blocks, dtype=dtypes.i32, device=device)
-    num_valid_ids = torch.empty(2, dtype=dtypes.i32, device=device)
-    moe_buf = torch.empty((M, model_dim), dtype=moebuf_dtype, device=device)
+    sorted_expert_ids = torch.zeros(max_num_m_blocks, dtype=dtypes.i32, device=device)
+    num_valid_ids = torch.zeros(2, dtype=dtypes.i32, device=device)
+    moe_buf = torch.zeros((M, model_dim), dtype=moebuf_dtype, device=device)
 
     if use_opus:
         ws_size = aiter.moe_sorting_opus_get_workspace_size(
