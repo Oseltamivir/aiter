@@ -45,7 +45,7 @@ def _moe_sorting_impl(
     max_num_tokens_padded = int(topk_ids.numel() + num_experts * block_size - topk)
 
     max_num_m_blocks = int((max_num_tokens_padded + block_size - 1) // block_size)
-    invalid_sorted_id = (topk << 24) | M
+    invalid_sorted_id = M
     # MoE stage kernels consume block-padded sorted metadata. Padding entries
     # must be deterministic even if the sorting kernel only writes valid
     # assignments.
@@ -60,7 +60,7 @@ def _moe_sorting_impl(
     )
     sorted_expert_ids = torch.full(
         (max_num_m_blocks,),
-        -1,
+        0,
         dtype=dtypes.i32,
         device=device,
     )
@@ -171,7 +171,7 @@ def _is_fp4_sorted_metadata_path(quant_type, q_dtype_w, block_size_M):
     )
 
 
-def _compact_fp4_sorted_metadata(
+def _sanitize_fp4_ck_moe_metadata(
     sorted_ids,
     sorted_weights,
     sorted_expert_ids,
@@ -179,27 +179,27 @@ def _compact_fp4_sorted_metadata(
     M,
     topk,
     global_E,
+    local_E,
     block_size_M,
     metadata,
 ):
-    # Some FP4 MoE launchers size work from the allocated sorted metadata
-    # tensors rather than the valid post-sort block count. Keep the tensors
-    # compact so both 1-stage and 2-stage paths launch only real expert blocks.
+    # CK MoE kernels may compute expert-weight addresses before all padded
+    # token rows are skipped. Keep launched metadata compact and normalize
+    # padding to the CK-safe contract:
+    #   sorted_ids token sentinel = M
+    #   sorted_weights padding = 0
+    #   sorted_expert_ids padding = a valid local expert id, 0
     block_size_M = int(block_size_M)
     valid_tokens_post_pad = int(num_valid_ids[0].item())
     valid_blocks_by_num_valid = (
         valid_tokens_post_pad + block_size_M - 1
     ) // block_size_M
 
-    valid_blocks_by_sentinel = int((sorted_expert_ids >= 0).sum().item())
-    if 0 < valid_blocks_by_sentinel < sorted_expert_ids.shape[0]:
-        valid_blocks = max(valid_blocks_by_sentinel, valid_blocks_by_num_valid)
-    else:
-        valid_blocks = valid_blocks_by_num_valid
+    valid_blocks = valid_blocks_by_num_valid
     if valid_blocks <= 0:
-        valid_blocks = valid_blocks_by_sentinel
+        valid_blocks = sorted_expert_ids.shape[0]
     if valid_blocks <= 0:
-        return sorted_ids, sorted_weights, sorted_expert_ids
+        return sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids
 
     valid_blocks = min(valid_blocks, sorted_expert_ids.shape[0])
     valid_token_capacity = min(valid_blocks * block_size_M, sorted_ids.shape[0])
@@ -219,11 +219,39 @@ def _compact_fp4_sorted_metadata(
         else sorted_expert_ids[:valid_blocks].contiguous()
     )
 
+    raw_sorted_ids = compact_sorted_ids.to(dtypes.i32)
+    token_ids = raw_sorted_ids & 0x00FFFFFF
+    slot_ids = raw_sorted_ids >> 24
+    invalid_ids = (token_ids >= M) | (slot_ids >= topk)
+    invalid_experts = (compact_sorted_expert_ids < 0) | (
+        compact_sorted_expert_ids >= local_E
+    )
+
+    invalid_ids_count = int(invalid_ids.sum().item())
+    invalid_experts_count = int(invalid_experts.sum().item())
+    if invalid_ids_count:
+        compact_sorted_ids = compact_sorted_ids.clone()
+        compact_sorted_weights = compact_sorted_weights.clone()
+        compact_sorted_ids[invalid_ids] = M
+        compact_sorted_weights[invalid_ids] = 0.0
+    if invalid_experts_count:
+        compact_sorted_expert_ids = compact_sorted_expert_ids.clone()
+        compact_sorted_expert_ids[invalid_experts] = 0
+
+    compact_num_valid_ids = num_valid_ids
+    if num_valid_ids.numel() >= 2:
+        compact_num_valid_ids = num_valid_ids.clone()
+        compact_num_valid_ids[0] = min(
+            int(num_valid_ids[0].item()), valid_token_capacity
+        )
+        compact_num_valid_ids[1] = M
+
     global _MOE_DEBUG_BLOCKS_PRINTED
     if _moe_debug_enabled() and not _MOE_DEBUG_BLOCKS_PRINTED:
         print(
-            "[AITER MoE debug] "
-            f"M={M} topk={topk} E={global_E} block_m={block_size_M} "
+            "[AITER MoE sanitized] "
+            f"M={M} topk={topk} E={global_E} local_E={local_E} "
+            f"block_m={block_size_M} "
             f"run_1stage={metadata.run_1stage} "
             f"stage1={_callable_name(metadata.stage1)} "
             f"stage2={_callable_name(metadata.stage2)} "
@@ -231,14 +259,20 @@ def _compact_fp4_sorted_metadata(
             f"compacted_sorted_ids={tuple(compact_sorted_ids.shape)} "
             f"sorted_expert_ids={tuple(sorted_expert_ids.shape)} "
             f"compacted_sorted_expert_ids={tuple(compact_sorted_expert_ids.shape)} "
-            f"num_valid_ids={num_valid_ids.detach().cpu().tolist()} "
-            f"valid_blocks_by_sentinel={valid_blocks_by_sentinel} "
-            f"valid_blocks_by_num_valid={valid_blocks_by_num_valid}",
+            f"num_valid_ids={compact_num_valid_ids.detach().cpu().tolist()} "
+            f"valid_blocks_by_num_valid={valid_blocks_by_num_valid} "
+            f"invalid_ids={invalid_ids_count} "
+            f"invalid_experts={invalid_experts_count}",
             flush=True,
         )
         _MOE_DEBUG_BLOCKS_PRINTED = True
 
-    return compact_sorted_ids, compact_sorted_weights, compact_sorted_expert_ids
+    return (
+        compact_sorted_ids,
+        compact_sorted_weights,
+        compact_sorted_expert_ids,
+        compact_num_valid_ids,
+    )
 
 
 def _debug_row0_repeated_input(hidden_states, topk_ids, topk_weight):
@@ -525,16 +559,19 @@ def fused_moe_(
     )
 
     if _is_fp4_sorted_metadata_path(quant_type, q_dtype_w, block_size_M):
-        sorted_ids, sorted_weights, sorted_expert_ids = _compact_fp4_sorted_metadata(
-            sorted_ids,
-            sorted_weights,
-            sorted_expert_ids,
-            num_valid_ids,
-            M,
-            topk,
-            global_E,
-            block_size_M,
-            metadata,
+        sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids = (
+            _sanitize_fp4_ck_moe_metadata(
+                sorted_ids,
+                sorted_weights,
+                sorted_expert_ids,
+                num_valid_ids,
+                M,
+                topk,
+                global_E,
+                E,
+                block_size_M,
+                metadata,
+            )
         )
 
     if metadata.run_1stage:
