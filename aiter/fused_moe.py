@@ -89,6 +89,10 @@ def _moe_sorting_impl(
             num_local_tokens,
             dispatch_policy,
         )
+    # The routed MoE output is an accumulator over top-k expert contributions.
+    # Sorting kernels receive this buffer for historical API reasons, but the
+    # fused expert stages must not inherit stale values from torch.empty().
+    moe_buf.zero_()
     return sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf
 
 

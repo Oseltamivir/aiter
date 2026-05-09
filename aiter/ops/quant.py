@@ -663,6 +663,9 @@ def mxfp4_moe_sort_fwd(
         dtype=dtypes.fp8_e8m0,
         device=scale.device,
     )
+    # Padded rows may be read by block MoE kernels. Initialize them to the
+    # neutral E8M0 scale (1.0) so masked/padded reads are deterministic.
+    out_scale.view(torch.uint8).fill_(0x7F)
     mxfp4_moe_sort_hip(out_scale, scale, sorted_ids, num_valid_ids, token_num, cols)
     return out_scale
 
