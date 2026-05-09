@@ -23,6 +23,7 @@ BLOCK_SIZE_M = 32
 
 # Default to Opus unless CK sorting is explicitly requested.
 _USE_CK_MOE_SORTING = os.environ.get("AITER_USE_CK_MOE_SORTING", "0") == "1"
+_MOE_DEBUG_BLOCKS_PRINTED = False
 
 
 def _moe_sorting_impl(
@@ -55,7 +56,12 @@ def _moe_sorting_impl(
     sorted_weights = torch.zeros(
         max_num_tokens_padded, dtype=dtypes.fp32, device=device
     )
-    sorted_expert_ids = torch.zeros(max_num_m_blocks, dtype=dtypes.i32, device=device)
+    sorted_expert_ids = torch.full(
+        (max_num_m_blocks,),
+        -1,
+        dtype=dtypes.i32,
+        device=device,
+    )
     num_valid_ids = torch.zeros(2, dtype=dtypes.i32, device=device)
     moe_buf = torch.zeros((M, model_dim), dtype=moebuf_dtype, device=device)
 
@@ -139,6 +145,62 @@ def moe_sorting(
             f"Moe_sorting info: {max_num_tokens_padded=} {block_size=} {num_experts=} {topk=} {topk_ids.shape=}"
         )
         raise e
+
+
+def _compact_fp4_asm_sorted_expert_ids(
+    sorted_ids,
+    sorted_expert_ids,
+    num_valid_ids,
+    M,
+    topk,
+    global_E,
+    block_size_M,
+):
+    # ASM fmoe_g1u1 uses sorted_expert_ids.size(0) for both kernel selection
+    # and grid size. The sorting buffer is allocated at max padded capacity,
+    # so pass only the blocks reported valid by the sorting kernel.
+    block_size_M = int(block_size_M)
+    valid_tokens_post_pad = int(num_valid_ids[0].item())
+    valid_blocks_by_num_valid = (
+        valid_tokens_post_pad + block_size_M - 1
+    ) // block_size_M
+
+    debug_blocks = os.environ.get("AITER_DSV4_MOE_DEBUG_BLOCKS", "0") == "1"
+    valid_blocks_by_sentinel = None
+    if debug_blocks or valid_blocks_by_num_valid <= 0:
+        valid_blocks_by_sentinel = int((sorted_expert_ids >= 0).sum().item())
+
+    valid_blocks = valid_blocks_by_num_valid
+    if valid_blocks <= 0 and valid_blocks_by_sentinel is not None:
+        valid_blocks = valid_blocks_by_sentinel
+    if valid_blocks <= 0:
+        return sorted_expert_ids
+
+    valid_blocks = min(valid_blocks, sorted_expert_ids.shape[0])
+    compact_sorted_expert_ids = (
+        sorted_expert_ids
+        if valid_blocks == sorted_expert_ids.shape[0]
+        else sorted_expert_ids[:valid_blocks].contiguous()
+    )
+
+    global _MOE_DEBUG_BLOCKS_PRINTED
+    if debug_blocks and not _MOE_DEBUG_BLOCKS_PRINTED:
+        if valid_blocks_by_sentinel is None:
+            valid_blocks_by_sentinel = int((sorted_expert_ids >= 0).sum().item())
+        print(
+            "[AITER MoE debug] "
+            f"M={M} topk={topk} E={global_E} block_m={block_size_M} "
+            f"sorted_ids={tuple(sorted_ids.shape)} "
+            f"sorted_expert_ids={tuple(sorted_expert_ids.shape)} "
+            f"compacted_sorted_expert_ids={tuple(compact_sorted_expert_ids.shape)} "
+            f"num_valid_ids={num_valid_ids.detach().cpu().tolist()} "
+            f"valid_blocks_by_sentinel={valid_blocks_by_sentinel} "
+            f"valid_blocks_by_num_valid={valid_blocks_by_num_valid}",
+            flush=True,
+        )
+        _MOE_DEBUG_BLOCKS_PRINTED = True
+
+    return compact_sorted_expert_ids
 
 
 # Lru cache will using hash to create key, which makes error when w1,w2 shape is symint.
@@ -349,6 +411,20 @@ def fused_moe_(
     )
 
     if metadata.run_1stage:
+        if (
+            quant_type == QuantType.per_1x32
+            and q_dtype_w == dtypes.fp4x2
+            and block_size_M is not None
+        ):
+            sorted_expert_ids = _compact_fp4_asm_sorted_expert_ids(
+                sorted_ids,
+                sorted_expert_ids,
+                num_valid_ids,
+                M,
+                topk,
+                global_E,
+                block_size_M,
+            )
         return metadata.stage1(
             hidden_states,
             w1,
