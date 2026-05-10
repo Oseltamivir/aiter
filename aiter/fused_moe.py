@@ -44,6 +44,96 @@ def _dsv4_moe_trace_slot():
     return globals().get("_DSV4_MOE_TRACE_SLOT", None)
 
 
+def _dsv4_moe_trace_require_prodlike():
+    return os.environ.get("AITER_DSV4_MOE_TRACE_REQUIRE_PRODLIKE", "0") == "1"
+
+
+def _dsv4_moe_prodlike_min_m():
+    return int(os.environ.get("AITER_DSV4_MOE_PRODLIKE_MIN_M", "128"))
+
+
+def _dsv4_moe_stage_name(fn):
+    try:
+        return _callable_name(fn)
+    except Exception:
+        return getattr(fn, "__name__", fn.__class__.__name__)
+
+
+def _dsv4_moe_tensor_kind(tensor):
+    if tensor is None:
+        return "none"
+    dtype = tensor.dtype
+    if dtype == dtypes.fp4x2:
+        return "fp4"
+    if dtype == dtypes.fp8:
+        return "fp8"
+    if dtype == dtypes.bf16:
+        return "bf16"
+    if dtype == dtypes.fp16:
+        return "fp16"
+    return str(dtype).replace("torch.", "")
+
+
+def _dsv4_moe_is_prod_like(metadata, *, M, topk, block_size_M):
+    stage1 = _dsv4_moe_stage_name(metadata.stage1)
+    stage2 = _dsv4_moe_stage_name(metadata.stage2)
+    try:
+        block_m = int(block_size_M)
+    except Exception:
+        block_m = -1
+    prod_like = (
+        int(M) >= _dsv4_moe_prodlike_min_m()
+        and block_m >= 128
+        and "ck_moe_stage1" in stage1
+        and "ck_moe_stage2" in stage2
+    )
+    if _dsv4_moe_trace_require_prodlike() and not prod_like:
+        ctx = _dsv4_moe_trace_context()
+        slot = _dsv4_moe_trace_slot()
+        key = ("trace_skip", ctx, slot, int(M), int(topk), block_m, stage1, stage2)
+        if key not in _DSV4_MOE_TRACE_SEEN:
+            _DSV4_MOE_TRACE_SEEN.add(key)
+            print(
+                "[AITER MoE trace skip] "
+                f"ctx={ctx or '<none>'} "
+                f"slot={slot if slot is not None else '-'} "
+                f"M={M} topk={topk} block_m={block_m} "
+                f"stage1={stage1} stage2={stage2} reason=non_prodlike",
+                flush=True,
+            )
+    return prod_like or not _dsv4_moe_trace_require_prodlike()
+
+
+def _dsv4_moe_dispatch_trace(
+    metadata,
+    *,
+    ctx="",
+    slot=None,
+    M,
+    topk,
+    block_size_M,
+    q_dtype_a,
+    q_dtype_w,
+):
+    if not ctx:
+        return
+    key = ("dispatch", ctx, slot, int(M), int(topk), int(block_size_M))
+    if key in _DSV4_MOE_TRACE_SEEN:
+        return
+    _DSV4_MOE_TRACE_SEEN.add(key)
+    print(
+        "[AITER MoE dispatch] "
+        f"ctx={ctx or '<none>'} "
+        f"slot={slot if slot is not None else '-'} "
+        f"M={M} topk={topk} block_m={block_size_M} "
+        f"q_dtype_a={q_dtype_a} q_dtype_w={q_dtype_w} "
+        f"fuse_quant={metadata.fuse_quant} "
+        f"stage1={_dsv4_moe_stage_name(metadata.stage1)} "
+        f"stage2={_dsv4_moe_stage_name(metadata.stage2)}",
+        flush=True,
+    )
+
+
 def _dsv4_moe_rowcheck(label, tensor, *, ctx="", slot=None, rows=16, tol=1e-3, once=True):
     if os.environ.get("AITER_DSV4_MOE_ROW_CHECK", "0") != "1":
         return
@@ -839,9 +929,10 @@ def fused_moe_(
             q_dtype_a = dtypes.fp4x2
 
     ctx = _dsv4_moe_trace_context()
-    _dsv4_moe_rowcheck("entry.hidden_states", hidden_states, ctx=ctx)
-    _dsv4_moe_rowcheck("entry.topk_weight", topk_weight, ctx=ctx)
-    _dsv4_moe_rowcheck("entry.topk_ids", topk_ids, ctx=ctx)
+    entry_ctx = "" if _dsv4_moe_trace_require_prodlike() else ctx
+    _dsv4_moe_rowcheck("entry.hidden_states", hidden_states, ctx=entry_ctx)
+    _dsv4_moe_rowcheck("entry.topk_weight", topk_weight, ctx=entry_ctx)
+    _dsv4_moe_rowcheck("entry.topk_ids", topk_ids, ctx=entry_ctx)
 
     global _DSV4_MOE_DETERMINISTIC_TOPK1_ACTIVE
     is_dsv4_fp4_routed = (
@@ -863,6 +954,7 @@ def fused_moe_(
                 dtype=torch.float32,
                 device=hidden_states.device,
             )
+            topk1_trace_any = False
             for k in range(topk):
                 old_slot = globals().get("_DSV4_MOE_TRACE_SLOT", None)
                 globals()["_DSV4_MOE_TRACE_SLOT"] = k
@@ -892,10 +984,19 @@ def fused_moe_(
                     )
                 finally:
                     globals()["_DSV4_MOE_TRACE_SLOT"] = old_slot
+                out_prodlike = bool(
+                    globals().get("_DSV4_MOE_TRACE_LAST_PRODLIKE", False)
+                )
+                topk1_trace_any = topk1_trace_any or out_prodlike
+                topk1_ctx = (
+                    ctx
+                    if not _dsv4_moe_trace_require_prodlike() or out_prodlike
+                    else ""
+                )
                 _dsv4_moe_rowcheck(
                     "topk1.out_k",
                     out_k,
-                    ctx=ctx,
+                    ctx=topk1_ctx,
                     slot=k,
                     once=False,
                 )
@@ -903,7 +1004,7 @@ def fused_moe_(
                 _dsv4_moe_rowcheck(
                     "topk1.acc_after_k",
                     acc,
-                    ctx=ctx,
+                    ctx=topk1_ctx,
                     slot=k,
                     once=False,
                 )
@@ -911,7 +1012,12 @@ def fused_moe_(
             _dsv4_moe_rowcheck(
                 "topk1.final",
                 final,
-                ctx=ctx,
+                ctx=(
+                    ctx
+                    if not _dsv4_moe_trace_require_prodlike()
+                    or topk1_trace_any
+                    else ""
+                ),
                 slot="final",
                 once=False,
             )
@@ -941,6 +1047,25 @@ def fused_moe_(
     # Ensure block_size_M is int (metadata.block_m from CSV may be float)
     if block_size_M is not None:
         block_size_M = int(block_size_M)
+    trace_this = _dsv4_moe_is_prod_like(
+        metadata,
+        M=M,
+        topk=topk,
+        block_size_M=block_size_M,
+    )
+    globals()["_DSV4_MOE_TRACE_LAST_PRODLIKE"] = trace_this
+    trace_ctx = ctx if trace_this else ""
+    trace_slot = _dsv4_moe_trace_slot() if trace_this else None
+    _dsv4_moe_dispatch_trace(
+        metadata,
+        ctx=trace_ctx,
+        slot=trace_slot,
+        M=M,
+        topk=topk,
+        block_size_M=block_size_M,
+        q_dtype_a=q_dtype_a,
+        q_dtype_w=q_dtype_w,
+    )
     sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf = moe_sorting(
         topk_ids,
         topk_weight,
@@ -960,8 +1085,8 @@ def fused_moe_(
         num_valid_ids,
         M=M,
         topk=topk,
-        ctx=ctx,
-        slot=_dsv4_moe_trace_slot(),
+        ctx=trace_ctx,
+        slot=trace_slot,
     )
     debug_row0_repeated = _debug_row0_repeated_input(
         hidden_states, topk_ids, topk_weight
@@ -990,8 +1115,8 @@ def fused_moe_(
             num_valid_ids,
             M=M,
             topk=topk,
-            ctx=ctx,
-            slot=_dsv4_moe_trace_slot(),
+            ctx=trace_ctx,
+            slot=trace_slot,
         )
 
     if metadata.run_1stage:
@@ -1924,6 +2049,26 @@ def fused_moe_2stages(
     )
     ctx = _dsv4_moe_trace_context()
     slot = _dsv4_moe_trace_slot()
+    trace_this = _dsv4_moe_is_prod_like(
+        metadata,
+        M=token_num,
+        topk=topk,
+        block_size_M=block_size_M,
+    )
+    globals()["_DSV4_MOE_TRACE_LAST_PRODLIKE"] = trace_this
+    if not trace_this:
+        ctx = ""
+        slot = None
+    _dsv4_moe_dispatch_trace(
+        metadata,
+        ctx=ctx,
+        slot=slot,
+        M=token_num,
+        topk=topk,
+        block_size_M=block_size_M,
+        q_dtype_a=q_dtype_a,
+        q_dtype_w=q_dtype_w,
+    )
     _dsv4_moe_rowcheck(
         "stage1.input",
         hidden_states,
@@ -2013,7 +2158,7 @@ def fused_moe_2stages(
         ), "a1_scale must be provided for quantized input for fused_moe"
         a1 = hidden_states
     _dsv4_moe_rowcheck_bytes(
-        "stage1.a1_fp4_bytes",
+        f"stage1.a1_{_dsv4_moe_tensor_kind(a1)}_bytes",
         a1,
         ctx=ctx,
         slot=slot,
@@ -2040,7 +2185,7 @@ def fused_moe_2stages(
                 num_rows=num_local_tokens,
             )
             _dsv4_moe_rowcheck_bytes(
-                "stage1.a1_raw_probe_fp4_bytes",
+                f"stage1.a1_raw_probe_{_dsv4_moe_tensor_kind(a1_raw_probe)}_bytes",
                 a1_raw_probe,
                 ctx=ctx,
                 slot=slot,
@@ -2213,7 +2358,7 @@ def fused_moe_2stages(
         once=False,
     )
     _dsv4_moe_rowcheck_bytes(
-        "stage2.a2_fp4_bytes",
+        f"stage2.a2_{_dsv4_moe_tensor_kind(a2)}_bytes",
         a2,
         ctx=ctx,
         slot=slot,
@@ -2245,7 +2390,7 @@ def fused_moe_2stages(
             f"a2_shape={tuple(a2.shape)} a2_dtype={a2.dtype} "
             f"a2_scale_shape={tuple(a2_scale.shape) if a2_scale is not None else None} "
             f"moe_out_shape={tuple(moe_out.shape)} "
-            f"stage2={_callable_name(metadata.stage2)}",
+            f"stage2={_dsv4_moe_stage_name(metadata.stage2)}",
             flush=True,
         )
     stage2_ret = metadata.stage2(

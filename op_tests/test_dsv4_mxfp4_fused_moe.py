@@ -121,7 +121,7 @@ def test_dsv4_mxfp4_fused_moe_row0_repeated_replay_invariant():
 
     torch.manual_seed(1)
     device = "cuda"
-    M = 16
+    M = int(os.environ.get("AITER_TEST_MOE_M", "16"))
     model_dim = 7168
     # DSv4-Pro TP8 local routed expert dim is 3072 / 8 = 384, padded to 512.
     intermediate = 384
