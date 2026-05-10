@@ -85,6 +85,190 @@ def _dsv4_moe_rowcheck(label, tensor, *, ctx="", slot=None, rows=16, tol=1e-3, o
     )
 
 
+def _dsv4_moe_rowcheck_bytes(
+    label,
+    tensor,
+    *,
+    ctx="",
+    slot=None,
+    rows=16,
+    once=False,
+):
+    if os.environ.get("AITER_DSV4_MOE_ROW_CHECK", "0") != "1":
+        return
+    if not ctx and not once:
+        return
+    if tensor is None or tensor.ndim < 2:
+        return
+    try:
+        rows = int(os.environ.get("AITER_DSV4_MOE_ROW_CHECK_ROWS", rows))
+        n = min(rows, tensor.size(0))
+        if n < 1:
+            return
+        key = (ctx, label, slot, tuple(tensor.shape), str(tensor.dtype))
+        if once and key in _DSV4_MOE_TRACE_SEEN:
+            return
+        _DSV4_MOE_TRACE_SEEN.add(key)
+        b = tensor[:n].detach().contiguous().view(torch.uint8).reshape(n, -1)
+        diff = b != b[:1]
+        bad_rows = int(diff.any(dim=1).sum().item())
+        max_diff = (
+            int((b.to(torch.int16) - b[:1].to(torch.int16)).abs().max().item())
+            if b.numel()
+            else 0
+        )
+    except Exception as exc:
+        print(
+            "[AITER MoE trace bytes] "
+            f"ctx={ctx or '<none>'} "
+            f"slot={slot if slot is not None else '-'} "
+            f"{label}.rowcheck_failed={exc!r}",
+            flush=True,
+        )
+        return
+    print(
+        "[AITER MoE trace bytes] "
+        f"ctx={ctx or '<none>'} "
+        f"slot={slot if slot is not None else '-'} "
+        f"{label}: shape={tuple(tensor.shape)} dtype={tensor.dtype} "
+        f"byte_max_diff={max_diff} bad_rows={bad_rows}/{n}",
+        flush=True,
+    )
+
+
+def _dsv4_moe_metadata_check(
+    label,
+    sorted_ids,
+    sorted_weights,
+    sorted_expert_ids,
+    num_valid_ids,
+    *,
+    M,
+    topk,
+    ctx="",
+    slot=None,
+):
+    if os.environ.get("AITER_DSV4_MOE_ROW_CHECK", "0") != "1":
+        return
+    if not ctx:
+        return
+    try:
+        sid = sorted_ids.detach().to(torch.int32)
+        token = sid & 0x00FFFFFF
+        kslot = sid >> 24
+        token_valid = token < M
+        valid = token_valid & (kslot < topk)
+        valid_token = token[valid]
+        valid_slot = kslot[valid]
+        hist = (
+            torch.bincount(valid_token.long(), minlength=M)
+            if valid_token.numel()
+            else torch.zeros(M, device=sid.device, dtype=torch.long)
+        )
+        missing = int((hist == 0).sum().item())
+        dup = int((hist > 1).sum().item())
+        invalid_token = int((~token_valid).sum().item())
+        bad_slot = int((token_valid & (kslot >= topk)).sum().item())
+        padding_weights_nonzero = 0
+        weight_valid_maxdiff = 0.0
+        if sorted_weights is not None:
+            w = sorted_weights.detach().float()
+            if valid.numel() == w.numel():
+                padding_weights_nonzero = int((w[~valid].abs() > 0).sum().item())
+                w_valid = w[valid]
+                weight_valid_maxdiff = (
+                    float((w_valid - w_valid[:1]).abs().max().item())
+                    if w_valid.numel()
+                    else 0.0
+                )
+        nv = num_valid_ids.detach().cpu().tolist() if num_valid_ids is not None else []
+        experts_head = (
+            sorted_expert_ids[:8].detach().cpu().tolist()
+            if sorted_expert_ids is not None
+            else []
+        )
+        ids_head = sid[:32].detach().cpu().tolist()
+        token_min = int(valid_token.min().item()) if valid_token.numel() else -1
+        token_max = int(valid_token.max().item()) if valid_token.numel() else -1
+        slot_min = int(valid_slot.min().item()) if valid_slot.numel() else -1
+        slot_max = int(valid_slot.max().item()) if valid_slot.numel() else -1
+    except Exception as exc:
+        print(
+            "[AITER MoE metadata] "
+            f"ctx={ctx or '<none>'} "
+            f"slot={slot if slot is not None else '-'} "
+            f"{label}.check_failed={exc!r}",
+            flush=True,
+        )
+        return
+    print(
+        "[AITER MoE metadata] "
+        f"ctx={ctx or '<none>'} "
+        f"slot={slot if slot is not None else '-'} "
+        f"{label}: M={M} topk={topk} sorted_ids={tuple(sorted_ids.shape)} "
+        f"num_valid_ids={nv} valid={int(valid.sum().item())} "
+        f"invalid_token={invalid_token} missing={missing} dup={dup} "
+        f"bad_slot={bad_slot} token_min={token_min} token_max={token_max} "
+        f"slot_min={slot_min} slot_max={slot_max} "
+        f"weight_valid_maxdiff={weight_valid_maxdiff:.9g} "
+        f"padding_weights_nonzero={padding_weights_nonzero} "
+        f"expert_ids_head={experts_head} ids_head={ids_head}",
+        flush=True,
+    )
+
+
+def _dsv4_moe_canary_enabled():
+    return os.environ.get("AITER_DSV4_MOE_CANARY", "0") == "1"
+
+
+def _dsv4_moe_canary_fill(tensor, label, *, ctx="", slot=None):
+    if not _dsv4_moe_canary_enabled() or tensor is None:
+        return
+    if not ctx:
+        return
+    try:
+        tensor.fill_(1234.0)
+        print(
+            "[AITER MoE canary] "
+            f"ctx={ctx or '<none>'} "
+            f"slot={slot if slot is not None else '-'} "
+            f"{label}.filled shape={tuple(tensor.shape)} dtype={tensor.dtype}",
+            flush=True,
+        )
+    except Exception as exc:
+        print(
+            "[AITER MoE canary] "
+            f"ctx={ctx or '<none>'} "
+            f"slot={slot if slot is not None else '-'} "
+            f"{label}.fill_failed={exc!r}",
+            flush=True,
+        )
+
+
+def _dsv4_moe_canary_report(tensor, label, *, ctx="", slot=None):
+    if not _dsv4_moe_canary_enabled() or tensor is None:
+        return
+    if not ctx:
+        return
+    try:
+        canary_left = int((tensor == 1234.0).sum().item())
+        print(
+            "[AITER MoE canary] "
+            f"ctx={ctx or '<none>'} "
+            f"slot={slot if slot is not None else '-'} "
+            f"{label}.canary_left={canary_left}",
+            flush=True,
+        )
+    except Exception as exc:
+        print(
+            "[AITER MoE canary] "
+            f"ctx={ctx or '<none>'} "
+            f"slot={slot if slot is not None else '-'} "
+            f"{label}.report_failed={exc!r}",
+            flush=True,
+        )
+
+
 def _moe_sorting_impl(
     topk_ids,
     topk_weights,
@@ -695,6 +879,17 @@ def fused_moe_(
         num_local_tokens,
         moe_sorting_dispatch_policy,
     )
+    _dsv4_moe_metadata_check(
+        "post_sort",
+        sorted_ids,
+        sorted_weights,
+        sorted_expert_ids,
+        num_valid_ids,
+        M=M,
+        topk=topk,
+        ctx=ctx,
+        slot=_dsv4_moe_trace_slot(),
+    )
     debug_row0_repeated = _debug_row0_repeated_input(
         hidden_states, topk_ids, topk_weight
     )
@@ -713,6 +908,17 @@ def fused_moe_(
                 block_size_M,
                 metadata,
             )
+        )
+        _dsv4_moe_metadata_check(
+            "post_sanitize",
+            sorted_ids,
+            sorted_weights,
+            sorted_expert_ids,
+            num_valid_ids,
+            M=M,
+            topk=topk,
+            ctx=ctx,
+            slot=_dsv4_moe_trace_slot(),
         )
 
     if metadata.run_1stage:
@@ -1652,6 +1858,20 @@ def fused_moe_2stages(
         slot=slot,
         once=False,
     )
+    _dsv4_moe_rowcheck(
+        "stage1.bf16_input",
+        hidden_states,
+        ctx=ctx,
+        slot=slot,
+        once=False,
+    )
+    _dsv4_moe_rowcheck_bytes(
+        "stage1.a1_scale_input_bytes",
+        a1_scale,
+        ctx=ctx,
+        slot=slot,
+        once=False,
+    )
     if (
         quant_type == QuantType.per_1x32
         and dtype in [dtypes.bf16, dtypes.fp16]
@@ -1719,6 +1939,20 @@ def fused_moe_2stages(
             a1_scale is not None or quant_type == QuantType.No
         ), "a1_scale must be provided for quantized input for fused_moe"
         a1 = hidden_states
+    _dsv4_moe_rowcheck_bytes(
+        "stage1.a1_fp4_bytes",
+        a1,
+        ctx=ctx,
+        slot=slot,
+        once=False,
+    )
+    _dsv4_moe_rowcheck_bytes(
+        "stage1.a1_scale_sorted_bytes",
+        a1_scale,
+        ctx=ctx,
+        slot=slot,
+        once=False,
+    )
     if quant_type == QuantType.per_1x128 and metadata.stage1.func is asm_stage1:
         ratio = a1_scale.element_size() // a1.element_size()
         a2 = torch.empty(
@@ -1744,6 +1978,8 @@ def fused_moe_2stages(
     ):
         extra_stage1_args["bias1"] = bias1
         extra_stage2_args["bias2"] = bias2
+    if not metadata.fuse_quant:
+        _dsv4_moe_canary_fill(a2, "stage1.out_pre", ctx=ctx, slot=slot)
     a2 = metadata.stage1(
         a1,
         w1,
@@ -1760,6 +1996,22 @@ def fused_moe_2stages(
         ),
         sorted_weights=sorted_weights if doweight_stage1 else None,
         **extra_stage1_args,
+    )
+    stage1_raw = a2[0] if isinstance(a2, tuple) else a2
+    _dsv4_moe_canary_report(stage1_raw, "stage1.raw_out", ctx=ctx, slot=slot)
+    _dsv4_moe_rowcheck(
+        "stage1.raw_out",
+        stage1_raw,
+        ctx=ctx,
+        slot=slot,
+        once=False,
+    )
+    _dsv4_moe_rowcheck_bytes(
+        "stage1.raw_out_bytes",
+        stage1_raw,
+        ctx=ctx,
+        slot=slot,
+        once=False,
     )
     if metadata.fuse_quant == "fp4" and isinstance(a2, tuple):
         a2_raw, a2_scale = a2[0], a2[1]
@@ -1831,6 +2083,27 @@ def fused_moe_2stages(
         "moe_stage1_out", a2, debug_row0_repeated, topk
     )
     _dsv4_moe_rowcheck(
+        "stage2.input",
+        a2,
+        ctx=ctx,
+        slot=slot,
+        once=False,
+    )
+    _dsv4_moe_rowcheck_bytes(
+        "stage2.a2_fp4_bytes",
+        a2,
+        ctx=ctx,
+        slot=slot,
+        once=False,
+    )
+    _dsv4_moe_rowcheck_bytes(
+        "stage2.a2_scale_sorted_bytes",
+        a2_scale,
+        ctx=ctx,
+        slot=slot,
+        once=False,
+    )
+    _dsv4_moe_rowcheck(
         "stage1.out",
         a2,
         ctx=ctx,
@@ -1838,6 +2111,7 @@ def fused_moe_2stages(
         once=False,
     )
 
+    _dsv4_moe_canary_fill(moe_out, "stage2.out_pre", ctx=ctx, slot=slot)
     metadata.stage2(
         a2,
         w1,
@@ -1859,6 +2133,7 @@ def fused_moe_2stages(
     _debug_row0_repeated_tensor(
         "moe_stage2_out", moe_out, debug_row0_repeated, topk
     )
+    _dsv4_moe_canary_report(moe_out, "stage2.out", ctx=ctx, slot=slot)
     _dsv4_moe_rowcheck(
         "stage2.out",
         moe_out,
