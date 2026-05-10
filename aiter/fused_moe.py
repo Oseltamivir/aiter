@@ -31,6 +31,58 @@ _MOE_DEBUG_BLOCKS_PRINTED = False
 _MOE_DEBUG_REPEATED_INPUT_PRINTED = False
 _MOE_DEBUG_REPEATED_STAGES_PRINTED = set()
 _MOE_DEBUG_REPEATED_INPUT_PRINTED_KEYS = set()
+_DSV4_MOE_TRACE_CONTEXT = None
+_DSV4_MOE_TRACE_SLOT = None
+_DSV4_MOE_TRACE_SEEN = set()
+
+
+def _dsv4_moe_trace_context():
+    return globals().get("_DSV4_MOE_TRACE_CONTEXT", "") or ""
+
+
+def _dsv4_moe_trace_slot():
+    return globals().get("_DSV4_MOE_TRACE_SLOT", None)
+
+
+def _dsv4_moe_rowcheck(label, tensor, *, ctx="", slot=None, rows=16, tol=1e-3, once=True):
+    if os.environ.get("AITER_DSV4_MOE_ROW_CHECK", "0") != "1":
+        return
+    if not ctx and not once:
+        return
+    if tensor is None or tensor.ndim < 2:
+        return
+    try:
+        rows = int(os.environ.get("AITER_DSV4_MOE_ROW_CHECK_ROWS", rows))
+        tol = float(os.environ.get("AITER_DSV4_MOE_ROW_CHECK_TOL", tol))
+        n = min(rows, tensor.size(0))
+        if n < 1:
+            return
+        key = (ctx, label, slot, tuple(tensor.shape))
+        if once and key in _DSV4_MOE_TRACE_SEEN:
+            return
+        _DSV4_MOE_TRACE_SEEN.add(key)
+        view = tensor[:n].detach().float().reshape(n, -1)
+        diff = (view - view[:1]).abs()
+        row_max = diff.amax(dim=1) if diff.numel() else torch.empty(0, device=view.device)
+        max_abs = float(row_max.max().item()) if row_max.numel() else 0.0
+        bad_rows = int((row_max > tol).sum().item()) if row_max.numel() else 0
+    except Exception as exc:
+        print(
+            "[AITER MoE trace] "
+            f"ctx={ctx or '<none>'} "
+            f"slot={slot if slot is not None else '-'} "
+            f"{label}.rowcheck_failed={exc!r}",
+            flush=True,
+        )
+        return
+    print(
+        "[AITER MoE trace] "
+        f"ctx={ctx or '<none>'} "
+        f"slot={slot if slot is not None else '-'} "
+        f"{label}: shape={tuple(tensor.shape)} "
+        f"max_abs={max_abs:.9g} bad_rows={bad_rows}/{n}",
+        flush=True,
+    )
 
 
 def _moe_sorting_impl(
@@ -529,6 +581,11 @@ def fused_moe_(
         else:
             q_dtype_a = dtypes.fp4x2
 
+    ctx = _dsv4_moe_trace_context()
+    _dsv4_moe_rowcheck("entry.hidden_states", hidden_states, ctx=ctx)
+    _dsv4_moe_rowcheck("entry.topk_weight", topk_weight, ctx=ctx)
+    _dsv4_moe_rowcheck("entry.topk_ids", topk_ids, ctx=ctx)
+
     global _DSV4_MOE_DETERMINISTIC_TOPK1_ACTIVE
     is_dsv4_fp4_routed = (
         quant_type == QuantType.per_1x32
@@ -550,31 +607,58 @@ def fused_moe_(
                 device=hidden_states.device,
             )
             for k in range(topk):
-                out_k = fused_moe_(
-                    hidden_states=hidden_states,
-                    w1=w1,
-                    w2=w2,
-                    topk_weight=topk_weight[:, k : k + 1].contiguous(),
-                    topk_ids=topk_ids[:, k : k + 1].contiguous(),
-                    expert_mask=expert_mask,
-                    activation=activation.value,
-                    quant_type=quant_type.value,
-                    doweight_stage1=doweight_stage1,
-                    w1_scale=w1_scale,
-                    w2_scale=w2_scale,
-                    a1_scale=a1_scale,
-                    a2_scale=a2_scale,
-                    block_size_M=-1 if block_size_M is None else int(block_size_M),
-                    num_local_tokens=num_local_tokens,
-                    moe_sorting_dispatch_policy=moe_sorting_dispatch_policy,
-                    dtype=dtype,
-                    hidden_pad=hidden_pad,
-                    intermediate_pad=intermediate_pad,
-                    bias1=bias1,
-                    bias2=bias2,
+                old_slot = globals().get("_DSV4_MOE_TRACE_SLOT", None)
+                globals()["_DSV4_MOE_TRACE_SLOT"] = k
+                try:
+                    out_k = fused_moe_(
+                        hidden_states=hidden_states,
+                        w1=w1,
+                        w2=w2,
+                        topk_weight=topk_weight[:, k : k + 1].contiguous(),
+                        topk_ids=topk_ids[:, k : k + 1].contiguous(),
+                        expert_mask=expert_mask,
+                        activation=activation.value,
+                        quant_type=quant_type.value,
+                        doweight_stage1=doweight_stage1,
+                        w1_scale=w1_scale,
+                        w2_scale=w2_scale,
+                        a1_scale=a1_scale,
+                        a2_scale=a2_scale,
+                        block_size_M=-1 if block_size_M is None else int(block_size_M),
+                        num_local_tokens=num_local_tokens,
+                        moe_sorting_dispatch_policy=moe_sorting_dispatch_policy,
+                        dtype=dtype,
+                        hidden_pad=hidden_pad,
+                        intermediate_pad=intermediate_pad,
+                        bias1=bias1,
+                        bias2=bias2,
+                    )
+                finally:
+                    globals()["_DSV4_MOE_TRACE_SLOT"] = old_slot
+                _dsv4_moe_rowcheck(
+                    "topk1.out_k",
+                    out_k,
+                    ctx=ctx,
+                    slot=k,
+                    once=False,
                 )
                 acc.add_(out_k.float())
-            return acc.to(dtype)
+                _dsv4_moe_rowcheck(
+                    "topk1.acc_after_k",
+                    acc,
+                    ctx=ctx,
+                    slot=k,
+                    once=False,
+                )
+            final = acc.to(dtype)
+            _dsv4_moe_rowcheck(
+                "topk1.final",
+                final,
+                ctx=ctx,
+                slot="final",
+                once=False,
+            )
+            return final
         finally:
             _DSV4_MOE_DETERMINISTIC_TOPK1_ACTIVE = False
 
@@ -1559,6 +1643,15 @@ def fused_moe_2stages(
         intermediate_pad,
         is_shuffled,
     )
+    ctx = _dsv4_moe_trace_context()
+    slot = _dsv4_moe_trace_slot()
+    _dsv4_moe_rowcheck(
+        "stage1.input",
+        hidden_states,
+        ctx=ctx,
+        slot=slot,
+        once=False,
+    )
     if (
         quant_type == QuantType.per_1x32
         and dtype in [dtypes.bf16, dtypes.fp16]
@@ -1737,6 +1830,13 @@ def fused_moe_2stages(
     _debug_row0_repeated_tensor(
         "moe_stage1_out", a2, debug_row0_repeated, topk
     )
+    _dsv4_moe_rowcheck(
+        "stage1.out",
+        a2,
+        ctx=ctx,
+        slot=slot,
+        once=False,
+    )
 
     metadata.stage2(
         a2,
@@ -1758,6 +1858,13 @@ def fused_moe_2stages(
 
     _debug_row0_repeated_tensor(
         "moe_stage2_out", moe_out, debug_row0_repeated, topk
+    )
+    _dsv4_moe_rowcheck(
+        "stage2.out",
+        moe_out,
+        ctx=ctx,
+        slot=slot,
+        once=False,
     )
 
     return moe_out
