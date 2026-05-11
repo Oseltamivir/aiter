@@ -43,8 +43,14 @@ def getLogger():
         logger.addHandler(console_handler)
         logger.propagate = False
 
-        if hasattr(torch._dynamo.config, "ignore_logger_methods"):
-            torch._dynamo.config.ignore_logger_methods = (
+        try:
+            dynamo_config = torch._dynamo.config
+        except Exception:
+            dynamo_config = None
+        if dynamo_config is not None and hasattr(
+            dynamo_config, "ignore_logger_methods"
+        ):
+            dynamo_config.ignore_logger_methods = (
                 logging.Logger.info,
                 logging.Logger.warning,
                 logging.Logger.debug,
